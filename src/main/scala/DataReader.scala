@@ -1,9 +1,5 @@
-import org.apache.log4j.{Level, Logger}
-import org.apache.spark.sql.types.{ArrayType, IntegerType, StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel}
-
-import scala.collection.mutable.ArrayBuffer
+import org.apache.spark.ml.feature.{CountVectorizer}
 
 object DataReader {
 

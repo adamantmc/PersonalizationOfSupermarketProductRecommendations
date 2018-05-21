@@ -1,5 +1,5 @@
 import org.apache.log4j.{Level, Logger}
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{SparkSession}
 import org.apache.spark.SparkConf
 import DataReader.read_groceries
 
@@ -14,6 +14,8 @@ object Main {
             .appName("Personalization of supermarket product recommendations")
             .config(conf)
             .getOrCreate()
+
+        Logger.getLogger("org").setLevel(Level.WARN)
 
         val groceries_df = read_groceries("data/groceries.csv", spark)
     }
