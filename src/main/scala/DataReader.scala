@@ -1,5 +1,5 @@
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.ml.feature.{CountVectorizer}
+import org.apache.spark.ml.feature.CountVectorizer
 
 object DataReader {
 
@@ -22,10 +22,14 @@ object DataReader {
 
         val product_categories_rdd = spark.sparkContext.textFile(product_categories_file)
             .map(str => str.split(","))
-            .map(arr => (arr(0 ), arr(1).split("/")))
+            .map(arr => (arr(0), arr(1).split("/").padTo(2, "")))
 
-        val product_categories_df = product_categories_rdd.toDF("product", "category")
-        product_categories_df.show(10)
+        val product_categories_df =
+            product_categories_rdd.toDF("product", "categories")
+                .withColumn("class", $"categories".getItem(0))
+                .withColumn("subclass", $"categories".getItem(1))
+
+        product_categories_df.show(10, false)
 
         transformed_groceries_df
     }
