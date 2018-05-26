@@ -1,7 +1,7 @@
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.sql.{SparkSession}
 import org.apache.spark.SparkConf
-import DataReader.read_groceries
+import DataReader.read_data
 
 object Main {
     def main(args: Array[String]): Unit = {
@@ -17,6 +17,10 @@ object Main {
 
         Logger.getLogger("org").setLevel(Level.WARN)
 
-        val groceries_df = read_groceries("data/groceries.csv", spark)
+        val groceries_df = read_data(
+            "data/groceries.csv",
+            "data/products-categorized.csv",
+            spark
+        )
     }
 }
