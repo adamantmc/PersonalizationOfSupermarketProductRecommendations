@@ -29,10 +29,16 @@ object Main {
             spark
         )
 
-        val customer_vectors_rdd = vectorize_customers(groceries_df, categories_df, "customer_vectors", spark)
+        val groceries_cast = cast_groceries_to_classes(groceries_df, categories_df, spark)
+        val customer_vectors_rdd = vectorize_customers(groceries_cast, categories_df, "customer_vectors", spark)
     }
 
-    def vectorize_customers(groceries: DataFrame, categories: DataFrame, outputCol: String, spark: SparkSession): RDD[(Int, Array[Double])] = {
+    def cast_groceries_to_classes(groceries: DataFrame,
+                                  categories: DataFrame,
+                                  spark: SparkSession,
+                                  subclass_groceries_output_col: String = "subclass_groceries",
+                                  class_groceries_output_col: String = "class_groceries"): DataFrame = {
+
         import spark.sqlContext.implicits._
 
         val udf_product_in_array = udf(
@@ -40,40 +46,38 @@ object Main {
         )
 
         /*
-            Since customer vectors are produced in the sub-class level, we need to know the subclass of each product
-            in each basket - in other words, we need to transform the 'product basket' to a 'subclass basket'.
             We join two rows of the groceries and categories dataframes if the product in the 'categories' row appears
-            in the basket of the 'groceries' row. Then we group by the basket_id, aggregate subclasses into a list,
-            and re-join with the groceries dataframe.
+            in the basket of the 'groceries' row. Then we group by the basket_id, aggregate subclasses and classes
+            into lists, and re-join with the groceries dataframe.
          */
         val groceries_joined = groceries
             .join(categories, udf_product_in_array($"groceries", categories.col("product")))
             .groupBy("basket_id")
-            .agg(collect_list("subclass"))
-            .toDF("basket_id", "subclass_list")
+            .agg(collect_list("subclass"), collect_list("class"))
+            .toDF("basket_id", subclass_groceries_output_col, class_groceries_output_col)
             .join(groceries, "basket_id")
 
+        groceries_joined
+    }
+
+    def vectorize_customers(groceries: DataFrame, categories: DataFrame, outputCol: String, spark: SparkSession): RDD[(Int, Array[Double])] = {
+        import spark.sqlContext.implicits._
+
         /*
-            Now we must vectorize each product subclass basket, and add them all together to get the total spending
-            of a customer per subclass.
-            We will use a CountVectorizer - to fit the vectorizer, we need arrays of strings, so we must convert
-            the String subclass column in categories DF to array
+            We must vectorize each product subclass basket, and add them all together to get the total spending
+            of a customer per subclass. We will use a CountVectorizer, fitted in the subclasses.
          */
 
-        val udf_str_to_arr = udf((str: String) => {
-            var arr = new Array[String](1)
-            arr(0) = str
-            arr
-        })
-
         val subclassCountVectorizer = new CountVectorizer()
-            .setInputCol("subclass_arr")
-            .fit(categories.withColumn("subclass_arr", udf_str_to_arr($"subclass")))
+            .setInputCol("subclass_groceries")
+            .fit(groceries)
 
         val groceries_subclass_vectors = subclassCountVectorizer
-            .setInputCol("subclass_list")
+            .setInputCol("subclass_groceries")
             .setOutputCol("subclass_vector")
-            .transform(groceries_joined)
+            .transform(groceries)
+
+        groceries_subclass_vectors.show(10, false)
 
         /*
             Now we have the vectors representing the spendings of each customer per subclass. Next step is
