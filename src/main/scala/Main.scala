@@ -2,14 +2,24 @@ import org.apache.log4j.{Level, Logger}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.SparkConf
 import DataReader.read_data
-import org.apache.spark.ml.feature.CountVectorizer
+import org.apache.spark.ml.feature.{CountVectorizer, CountVectorizerModel}
 import org.apache.spark.sql.functions._
 import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vectors}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.expressions.UserDefinedFunction
 
 import scala.collection.mutable
 
 object Main {
+
+    val udf_product_in_array: UserDefinedFunction = udf(
+        (groceries_arr: mutable.WrappedArray[String], product: String) => groceries_arr.contains(product)
+    )
+
+    val udf_str_to_array: UserDefinedFunction = udf(
+        (str: String) => Array[String](str)
+    )
+
     def main(args: Array[String]): Unit = {
         val conf = new SparkConf()
             .setMaster("local[4]")
@@ -21,6 +31,8 @@ object Main {
             .config(conf)
             .getOrCreate()
 
+        import spark.sqlContext.implicits._
+
         Logger.getLogger("org").setLevel(Level.WARN)
 
         val (groceries_df, categories_df) = read_data(
@@ -29,8 +41,25 @@ object Main {
             spark
         )
 
+        /*
+            Cast product baskets to subclass and class baskets
+            Format: basket_id: Int,
+                    subclass_groceries: Array[String], class_groceries: Array[String],
+                    customer_id: Int, groceries: Array[String]
+        */
         val groceries_cast = cast_groceries_to_classes(groceries_df, categories_df, spark)
-        val customer_vectors_rdd = vectorize_customers(groceries_cast, categories_df, "customer_vectors", spark)
+
+        val subclassCountVectorizer = new CountVectorizer()
+            .setInputCol("subclass_groceries")
+            .fit(groceries_cast)
+
+        val customer_vectors_rdd = vectorize_customers(groceries_cast, subclassCountVectorizer, "customer_vectors", spark)
+        val product_vectors_rdd = vectorize_products(categories_df, subclassCountVectorizer.vocabulary, "product_vectors", spark)
+
+        groceries_cast.toDF().show()
+        customer_vectors_rdd.toDF().show()
+        product_vectors_rdd.toDF().show()
+
     }
 
     def cast_groceries_to_classes(groceries: DataFrame,
@@ -40,10 +69,6 @@ object Main {
                                   class_groceries_output_col: String = "class_groceries"): DataFrame = {
 
         import spark.sqlContext.implicits._
-
-        val udf_product_in_array = udf(
-            (groceries_arr: mutable.WrappedArray[String], product: String) => groceries_arr.contains(product)
-        )
 
         /*
             We join two rows of the groceries and categories dataframes if the product in the 'categories' row appears
@@ -60,24 +85,67 @@ object Main {
         groceries_joined
     }
 
-    def vectorize_customers(groceries: DataFrame, categories: DataFrame, outputCol: String, spark: SparkSession): RDD[(Int, Array[Double])] = {
+    def vectorize_products(categories: DataFrame, subclasses: Array[String], outputCol: String, spark: SparkSession): RDD[(String, Array[Double])] = {
+        import spark.sqlContext.implicits._
+
+        val product_index = categories.columns.indexOf("product")
+        val class_index = categories.columns.indexOf("class")
+        val subclass_index = categories.columns.indexOf("subclass")
+
+        /*
+            To build the product vectors, we need to know:
+                1) Subclass of each product
+                2) Class of each product
+                3) Class of each subclass
+                4) Associated classes
+                5) Associated subclasses
+
+            The 'subclasses' array contains the distinct subclasses. Their order is also the order of the vector
+            that must be produced, aligned to the customer vectors. We must augment this array to also contain the class
+            of each subclass.
+        */
+
+        // We suppose that the subclass -> class array is small enough to fit into main memory
+        val subclass_class_arr =
+            categories
+                .select("subclass", "class") // Get sublcass and class
+                .distinct().rdd // Distinct, cast to RDD
+                .map(x => (x.getString(0), x.getString(1))) // Map to (subclass, class)
+                .filter(x => subclasses.contains(x._1)) // Filter subclasses not in baskets
+                .sortBy(x => subclasses.indexOf(x._1)) // Order by subclasses array to align with customer vectors
+                .collect() // Collect since we want to use it in another rdd operation
+
+        // Convert into RDD - tuple format (product, subclass, class)
+        val categories_rdd = categories.rdd
+            .map(x => (x.getString(product_index), x.getString(subclass_index), x.getString(class_index)))
+
+        // Compute product vectors and cast to (product, product_vector) tuples
+        categories_rdd.map(x => (x._1, {
+            val product = x._1
+            val product_subclass = x._2
+            val product_class = x._3
+
+            val vec = subclass_class_arr.map(x =>{
+                if(x._1 == product_subclass) 1.0
+                else if(x._2 == product_class) 0.5
+                else 0.0
+            })
+
+            vec
+        }))
+    }
+
+    def vectorize_customers(groceries: DataFrame, subclassCountVectorizer: CountVectorizerModel, outputCol: String, spark: SparkSession): RDD[(Int, Array[Double])] = {
         import spark.sqlContext.implicits._
 
         /*
             We must vectorize each product subclass basket, and add them all together to get the total spending
             of a customer per subclass. We will use a CountVectorizer, fitted in the subclasses.
          */
-
-        val subclassCountVectorizer = new CountVectorizer()
-            .setInputCol("subclass_groceries")
-            .fit(groceries)
-
         val groceries_subclass_vectors = subclassCountVectorizer
             .setInputCol("subclass_groceries")
             .setOutputCol("subclass_vector")
             .transform(groceries)
-
-        groceries_subclass_vectors.show(10, false)
 
         /*
             Now we have the vectors representing the spendings of each customer per subclass. Next step is

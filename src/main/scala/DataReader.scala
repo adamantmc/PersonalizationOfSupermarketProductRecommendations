@@ -18,13 +18,6 @@ object DataReader {
 
         val groceries_df = groceries_rdd.toDF("customer_id", "basket_id", "groceries")
 
-        val countVectorizer = new CountVectorizer()
-            .setInputCol("groceries")
-            .setOutputCol("groceries_vectors")
-            .fit(groceries_df)
-
-        val transformed_groceries_df = countVectorizer.transform(groceries_df)
-
         val product_categories_rdd = spark.sparkContext.textFile(product_categories_file)
             .map(str => str.split(","))
             .map(arr => (arr(0).trim(), arr(1).split("/").padTo(2, "").map(x => x.trim())))
@@ -33,8 +26,9 @@ object DataReader {
             product_categories_rdd.toDF("product", "categories")
                 .withColumn("class", $"categories".getItem(0))
                 .withColumn("subclass", $"categories".getItem(1))
+                .filter($"class" =!= "" && $"class" =!= "?" && $"subclass" =!= "" && $"subclass" =!= "?")
 
-        (transformed_groceries_df, product_categories_df)
+        (groceries_df, product_categories_df)
     }
 
 
