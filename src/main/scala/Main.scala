@@ -22,6 +22,10 @@ object Main {
         (str: String) => Array[String](str)
     )
 
+    val udf_arr_to_str: UserDefinedFunction = udf(
+        (arr: mutable.WrappedArray[String]) => arr(0)
+    )
+
     def main(args: Array[String]): Unit = {
         val conf = new SparkConf()
           .setMaster("local[4]")
@@ -52,55 +56,49 @@ object Main {
         val groceries_cast = cast_groceries_to_classes(groceries_df, categories_df, spark)
 
         val subclassCountVectorizer = new CountVectorizer()
-          .setInputCol("subclass_groceries")
-          .fit(groceries_cast)
+            .setInputCol("subclass_groceries")
+            .fit(groceries_cast)
+
+        val class_rules =
+            association_rules(groceries_cast, "class_groceries", 0.1, 0.6, spark)
+
+        val subclass_rules =
+            association_rules(groceries_cast, "subclass_groceries", 0.05, 0.4, spark)
 
         val customer_vectors_rdd = vectorize_customers(groceries_cast, subclassCountVectorizer, "customer_vectors", spark)
-        val product_vectors_rdd = vectorize_products(categories_df, subclassCountVectorizer.vocabulary, "product_vectors", spark)
+        val product_vectors_rdd = vectorize_products(
+            categories_df, subclassCountVectorizer.vocabulary,
+            class_rules, subclass_rules,
+            "product_vectors", spark
+        )
 
+        val recommendations = customer_vectors_rdd.cartesian(product_vectors_rdd)
+            .map(x => (x._1._1, (x._2._1, cosineSimilarity(x._1._2, x._2._2)))) // map to (customer, (product, similarity))
+            .groupByKey()
+            .map(x => (x._1, x._2.toSeq.sortBy(x => -x._2).take(10)))
 
-        // Extract association rules for the subclasses
-        val transactions_subclass = groceries_cast.select("subclass_groceries").map(x => x.getAs[mutable.WrappedArray[String]](0).distinct).select($"value".alias("subclass_groceries"))
-        val fpgrowth_subclass = new FPGrowth().setItemsCol("subclass_groceries").setMinSupport(0.05).setMinConfidence(0.4)
-        val model1 = fpgrowth_subclass.fit(transactions_subclass)
-        val association_rules_subclass = model1.associationRules
-        association_rules_subclass.show()
-
-        // Extract association rules for the classes
-        val transactions_class = groceries_cast.select("class_groceries").map(x => x.getAs[mutable.WrappedArray[String]](0).distinct).select($"value".alias("class_groceries"))
-        val fpgrowth_class = new FPGrowth().setItemsCol("class_groceries").setMinSupport(0.1).setMinConfidence(0.6)
-        val model2 = fpgrowth_class.fit(transactions_class)
-        val association_rules_class = model2.associationRules
-        association_rules_class.show(false)
-
-
+        recommendations.toDF().show(truncate = false)
     }
 
     /*
-  * This method takes 2 equal length arrays of integers
-  * It returns a double representing similarity of the 2 arrays
-  * 0.9925 would be 99.25% similar
-  * (x dot y)/||X|| ||Y||
+  * Cosine similarity of two vectors of same dimensionality
+  * cos(x, y) = (x dot y) / (||X||*||Y||)
   */
-    def cosineSimilarity(x: Array[Int], y: Array[Int]): Double = {
-        require(x.size == y.size)
-        dotProduct(x, y)/(magnitude(x) * magnitude(y))
-    }
+    def cosineSimilarity(x: Array[Double], y: Array[Double]): Double = {
+        var dot_product = 0.0
+        var x_mag = 0.0
+        var y_mag = 0.0
 
-    /*
-     * Return the dot product of the 2 arrays
-     * e.g. (a[0]*b[0])+(a[1]*a[2])
-     */
-    def dotProduct(x: Array[Int], y: Array[Int]): Int = {
-        (for((a, b) <- x zip y) yield a * b) sum
-    }
+        for((a, b) <- x zip y) {
+            dot_product += a * b
+            x_mag += a * a
+            y_mag += b * b
+        }
 
-    /*
-     * Return the magnitude of an array
-     * We multiply each element, sum it, then square root the result.
-     */
-    def magnitude(x: Array[Int]): Double = {
-        math.sqrt(x map(i => i*i) sum)
+        x_mag = math.sqrt(x_mag)
+        y_mag = math.sqrt(y_mag)
+
+       dot_product / (x_mag * y_mag)
     }
 
     def cast_groceries_to_classes(groceries: DataFrame,
@@ -108,7 +106,6 @@ object Main {
                                   spark: SparkSession,
                                   subclass_groceries_output_col: String = "subclass_groceries",
                                   class_groceries_output_col: String = "class_groceries"): DataFrame = {
-
         import spark.sqlContext.implicits._
 
         /*
@@ -117,16 +114,51 @@ object Main {
             into lists, and re-join with the groceries dataframe.
          */
         val groceries_joined = groceries
-          .join(categories, udf_product_in_array($"groceries", categories.col("product")))
-          .groupBy("basket_id")
-          .agg(collect_list("subclass"), collect_list("class"))
-          .toDF("basket_id", subclass_groceries_output_col, class_groceries_output_col)
-          .join(groceries, "basket_id")
+            .join(categories, udf_product_in_array($"groceries", categories.col("product")))
+            .groupBy("basket_id")
+            .agg(collect_list("subclass"), collect_list("class"))
+            .toDF("basket_id", subclass_groceries_output_col, class_groceries_output_col)
+            .join(groceries, "basket_id")
 
         groceries_joined
     }
 
-    def vectorize_products(categories: DataFrame, subclasses: Array[String], outputCol: String, spark: SparkSession): RDD[(String, Array[Double])] = {
+    def association_rules(groceries: DataFrame,
+                          inputCol: String,
+                          minSupport: Double, minConf: Double,
+                          spark: SparkSession) = {
+        import spark.sqlContext.implicits._
+
+        /*
+            Input column contains baskets which might have duplicate entries. We need to get
+            rid of them.
+         */
+        val udf_discretize_array = udf((groceries_arr: mutable.WrappedArray[String]) => groceries_arr.distinct)
+
+        val fpgrowth = new FPGrowth()
+            .setItemsCol("baskets_distinct")
+            .setMinSupport(minSupport)
+            .setMinConfidence(minConf)
+            .fit(groceries.withColumn("baskets_distinct", udf_discretize_array(groceries.col(inputCol))))
+
+        /*
+            We only care about rules with one product on the Left Hand Side.
+            Filter by lhs length, then cast columns from arrays to strings. Finally,
+            aggregate the right hand side column for each left hand side.
+         */
+        fpgrowth.associationRules
+            .filter(size($"antecedent") === 1)
+            .withColumn("lhs", udf_arr_to_str($"antecedent"))
+            .withColumn("rhs", udf_arr_to_str($"consequent"))
+            .groupBy($"lhs")
+            .agg(collect_list($"rhs") as "rhs")
+            .drop("antecedent")
+            .drop("consequent")
+    }
+
+    def vectorize_products(categories: DataFrame, subclasses: Array[String],
+                           class_rules: DataFrame, subclass_rules: DataFrame,
+                           outputCol: String, spark: SparkSession): RDD[(String, Array[Double])] = {
         import spark.sqlContext.implicits._
 
         val product_index = categories.columns.indexOf("product")
@@ -146,18 +178,28 @@ object Main {
         */
 
         // We suppose that the subclass -> class array is small enough to fit into main memory
-        val subclass_class_arr =
+        val categories_with_rules =
             categories
-              .select("subclass", "class") // Get sublcass and class
-              .distinct().rdd // Distinct, cast to RDD
-              .map(x => (x.getString(0), x.getString(1))) // Map to (subclass, class)
-              .filter(x => subclasses.contains(x._1)) // Filter subclasses not in baskets
-              .sortBy(x => subclasses.indexOf(x._1)) // Order by subclasses array to align with customer vectors
-              .collect() // Collect since we want to use it in another rdd operation
+                .select("subclass", "class") // Get sublcass and class
+                .distinct()
+                .join(subclass_rules, $"subclass" === subclass_rules.col("lhs"), "left_outer")
+                .drop("lhs")
+                .withColumnRenamed("rhs", "subclass_associations")
+                .join(class_rules, $"class" === class_rules.col("lhs"), "left_outer")
+                .drop("lhs")
+                .withColumnRenamed("rhs", "class_associations")
+
+        val subclass_class_arr = categories_with_rules.rdd // Cast to RDD
+                // Map to (subclass, class, subclass associations, class associations)
+                .map(x => (x.getString(0), x.getString(1), x.getAs[mutable.WrappedArray[String]](2), x.getAs[mutable.WrappedArray[String]](3)))
+                .filter(x => subclasses.contains(x._1)) // Filter subclasses not in baskets
+                .sortBy(x => subclasses.indexOf(x._1)) // Order by subclasses array to align with customer vectors
+                .collect() // Collect since we want to use it in another rdd operation
 
         // Convert into RDD - tuple format (product, subclass, class)
-        val categories_rdd = categories.rdd
-          .map(x => (x.getString(product_index), x.getString(subclass_index), x.getString(class_index)))
+        val categories_rdd = categories
+            .rdd
+            .map(x => (x.getString(product_index), x.getString(subclass_index), x.getString(class_index)))
 
         // Compute product vectors and cast to (product, product_vector) tuples
         categories_rdd.map(x => (x._1, {
@@ -166,8 +208,10 @@ object Main {
             val product_class = x._3
 
             val vec = subclass_class_arr.map(x =>{
-                if(x._1 == product_subclass) 1.0
-                else if(x._2 == product_class) 0.5
+                if(x._1 == product_subclass) 1.0 // Product subclass == current subclass
+                else if(x._2 == product_class) 0.5 // Product class == current class
+                else if(x._3 != null && x._3.contains(product_subclass)) 1.0 // Product subclass in current subclass associations
+                else if(x._4 != null && x._4.contains(product_class)) 0.25 // Product class in current class associations
                 else 0.0
             })
 
@@ -183,9 +227,9 @@ object Main {
             of a customer per subclass. We will use a CountVectorizer, fitted in the subclasses.
          */
         val groceries_subclass_vectors = subclassCountVectorizer
-          .setInputCol("subclass_groceries")
-          .setOutputCol("subclass_vector")
-          .transform(groceries)
+            .setInputCol("subclass_groceries")
+            .setOutputCol("subclass_vector")
+            .transform(groceries)
 
         /*
             Now we have the vectors representing the spendings of each customer per subclass. Next step is
@@ -205,8 +249,8 @@ object Main {
         val div_op = (a: Double, b: Double) => a / b
 
         val summed_vectors_per_customer = customer_vectors_rdd.map(x => (x._1, x._2.toArray))
-          .reduceByKey((arr1, arr2) => array_op_element_wise(arr1, arr2, add_op))
-          .map(x => (x._1, array_div_scalar(x._2, array_sum(x._2))))
+            .reduceByKey((arr1, arr2) => array_op_element_wise(arr1, arr2, add_op))
+            .map(x => (x._1, array_div_scalar(x._2, array_sum(x._2))))
 
         /*
             The customer vectors are now normalized by their total spending -
@@ -223,7 +267,7 @@ object Main {
 
         // Normalize customer vectors by total spending in each subclass
         val final_customer_vectors = summed_vectors_per_customer
-          .map(x => (x._1, array_op_element_wise(x._2, total_spending_vector_normalized, div_op)))
+            .map(x => (x._1, array_op_element_wise(x._2, total_spending_vector_normalized, div_op)))
 
         final_customer_vectors
     }
