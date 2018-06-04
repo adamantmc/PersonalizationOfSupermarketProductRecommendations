@@ -8,8 +8,6 @@ object DataReader {
         import spark.sqlContext.implicits._
 
         val random = Random
-        random.setSeed(733+737)
-
         val number_of_customers = 1000
 
         val groceries_rdd = spark.sparkContext.textFile(groceries_file)

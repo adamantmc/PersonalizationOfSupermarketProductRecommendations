@@ -60,10 +60,10 @@ object Main {
             .fit(groceries_cast)
 
         val class_rules =
-            association_rules(groceries_cast, "class_groceries", 0.1, 0.6, spark)
+            association_rules(groceries_cast, "class_groceries", 0.01, 0.4, spark)
 
         val subclass_rules =
-            association_rules(groceries_cast, "subclass_groceries", 0.05, 0.4, spark)
+            association_rules(groceries_cast, "subclass_groceries", 0.01, 0.4, spark)
 
         val customer_vectors_rdd = vectorize_customers(groceries_cast, subclassCountVectorizer, "customer_vectors", spark)
         val product_vectors_rdd = vectorize_products(
@@ -72,10 +72,51 @@ object Main {
             "product_vectors", spark
         )
 
-        val recommendations = customer_vectors_rdd.cartesian(product_vectors_rdd)
-            .map(x => (x._1._1, (x._2._1, cosineSimilarity(x._1._2, x._2._2)))) // map to (customer, (product, similarity))
+        // Get total groceries by customer, to be used in order to not recommend already bought products
+        val flatten = udf((xs: Seq[Seq[String]]) => xs.flatten)
+
+        val customer_groceries_aggregated_rdd = groceries_cast
+            .groupBy("customer_id")
+            .agg(flatten(collect_list("groceries")) as "total_groceries")
+            .rdd.map(x => (x.getInt(0), x.getAs[mutable.WrappedArray[String]](1)))
+
+        val recommendations = customer_vectors_rdd
+            .cartesian(product_vectors_rdd)
+            // map to (customer, (product, product_subclass, product_class, similarity))
+            .map(x => (x._1._1, (x._2._1, x._2._2, x._2._3, cosineSimilarity(x._1._2, x._2._4))))
             .groupByKey()
-            .map(x => (x._1, x._2.toSeq.sortBy(x => -x._2).take(10)))
+            .map(x => (x._1, x._2.toSeq.sortBy(y => -y._4)))
+            .join(customer_groceries_aggregated_rdd)
+            .map(x => {
+                val customer_groceries = x._2._2
+                var customer_recommendations = Seq[(String, String, String, Double)]()
+                var recommended_products = Set[String]()
+                var subclasses = Set[String]() // Holds subclasses for which we have recommended
+                var classes = Map[String, Int]() // Holds classes for which we already have recommended 2 products
+
+                for (elem <- x._2._1) {
+                    val product = elem._1
+                    val product_subclass = elem._2
+                    val product_class = elem._3
+
+                    // If product is not contained in customers basket and we have not already recommended it
+                    if(!customer_groceries.contains(product) && !recommended_products.contains(product)) {
+                        var times_class_recommended = 0
+
+                        if(classes.contains(product_class)) times_class_recommended = classes.get(product_class).get
+
+                        // We recommend at most one product per subclass and at most 2 products per class
+                        if(!subclasses.contains(product_subclass) && times_class_recommended < 2) {
+                            subclasses += product_subclass
+                            customer_recommendations = customer_recommendations :+ elem
+                            classes = classes.updated(product_class, times_class_recommended + 1)
+                            recommended_products += product
+                        }
+                    }
+                }
+
+                (x._1, customer_recommendations.map(x => (x._1, x._4)).take(10))
+            })
 
         recommendations.toDF().show(truncate = false)
     }
@@ -158,7 +199,7 @@ object Main {
 
     def vectorize_products(categories: DataFrame, subclasses: Array[String],
                            class_rules: DataFrame, subclass_rules: DataFrame,
-                           outputCol: String, spark: SparkSession): RDD[(String, Array[Double])] = {
+                           outputCol: String, spark: SparkSession): RDD[(String, String, String, Array[Double])] = {
         import spark.sqlContext.implicits._
 
         val product_index = categories.columns.indexOf("product")
@@ -201,8 +242,8 @@ object Main {
             .rdd
             .map(x => (x.getString(product_index), x.getString(subclass_index), x.getString(class_index)))
 
-        // Compute product vectors and cast to (product, product_vector) tuples
-        categories_rdd.map(x => (x._1, {
+        // Compute product vectors and cast to (product, product_subclass, procut_class, product_vector) tuples
+        categories_rdd.map(x => (x._1, x._2, x._3, {
             val product = x._1
             val product_subclass = x._2
             val product_class = x._3
