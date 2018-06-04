@@ -65,7 +65,11 @@ object Main {
         val subclass_rules =
             association_rules(groceries_cast, "subclass_groceries", 0.01, 0.4, spark)
 
-        val customer_vectors_rdd = vectorize_customers(groceries_cast, subclassCountVectorizer, "customer_vectors", spark)
+        val customer_vectors_rdd = vectorize_customers(
+            groceries_cast,
+            subclassCountVectorizer,
+            "customer_vectors", spark
+        )
         val product_vectors_rdd = vectorize_products(
             categories_df, subclassCountVectorizer.vocabulary,
             class_rules, subclass_rules,
@@ -84,9 +88,9 @@ object Main {
             .cartesian(product_vectors_rdd)
             // map to (customer, (product, product_subclass, product_class, similarity))
             .map(x => (x._1._1, (x._2._1, x._2._2, x._2._3, cosineSimilarity(x._1._2, x._2._4))))
-            .groupByKey()
-            .map(x => (x._1, x._2.toSeq.sortBy(y => -y._4)))
-            .join(customer_groceries_aggregated_rdd)
+            .groupByKey() // Group by customer
+            .map(x => (x._1, x._2.toSeq.sortBy(y => -y._4))) // Map to (customer, products sorted by similarity)
+            .join(customer_groceries_aggregated_rdd) // Join with total groceries per customer
             .map(x => {
                 val customer_groceries = x._2._2
                 var customer_recommendations = Seq[(String, String, String, Double)]()
@@ -94,6 +98,13 @@ object Main {
                 var subclasses = Set[String]() // Holds subclasses for which we have recommended
                 var classes = Map[String, Int]() // Holds classes for which we already have recommended 2 products
 
+                /*
+                 For each product, in descending similarity order, recommend it if:
+                     1) It has not been bought by the customer
+                     2) It has not been already recommended
+                     3) We have not already recommended a product from its subclass
+                     4) We have not already recommended 2 products from its class
+                */
                 for (elem <- x._2._1) {
                     val product = elem._1
                     val product_subclass = elem._2
